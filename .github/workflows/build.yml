@@ -1,4 +1,4 @@
-name: Build Alpine Native Image (Fix)
+name: Build Alpine for RouterOS (Fix Layer Error)
 
 on:
   workflow_dispatch: # 手动触发
@@ -6,45 +6,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
     steps:
-      # 1. 拉取源码 (Phantun 的 Rust 代码)
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. 设置构建环境
+      # 配置 QEMU 以支持 ARM64 编译
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-      
+
+      # 配置 Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 3. [关键步骤] 现场生成启动脚本
-      # 我们直接把您的脚本写入当前目录，确保 Docker 一定能找到它！
-      # 使用 'EOF' 防止变量在生成时被在此处解析
+      # 1. 现场生成启动脚本 (包含您习惯的变量和 sleep 3)
       - name: Generate Entrypoint Script
         run: |
           cat <<'EOF' > docker-entrypoint.sh
           #!/bin/sh
           set -e
 
-          # [Debian逻辑移植] 等待 ROS 网络就绪
+          # [关键] 等待 RouterOS 网卡初始化
           sleep 3
 
-          # 根据模式选择二进制文件名
+          # 根据模式选择程序
           EXEC_NAME="phantun-server"
           if [ "${RUN_MODE}" = "client" ]; then
               EXEC_NAME="phantun-client"
           fi
 
-          # 检查必要变量
+          # 检查变量
           if [ -z "${LOCAL_ADDR}" ]; then echo "Error: LOCAL_ADDR is not set"; exit 1; fi
           if [ -z "${REMOTE_ADDR}" ]; then echo "Error: REMOTE_ADDR is not set"; exit 1; fi
 
-          # 拼接可选参数
+          # 拼接参数
           ARGS=""
           if [ ! -z "${TUN_NAME}" ]; then ARGS="$ARGS --tun ${TUN_NAME}"; fi
           if [ ! -z "${TUN_LOCAL}" ]; then ARGS="$ARGS --tun_local ${TUN_LOCAL}"; fi
@@ -53,70 +47,69 @@ jobs:
           echo "Starting Phantun (${EXEC_NAME}) on Alpine Native..."
           echo "Local: ${LOCAL_ADDR} -> Remote: ${REMOTE_ADDR}"
 
-          # 使用 exec 启动
+          # 启动
           exec ${EXEC_NAME} \
             --local ${LOCAL_ADDR} \
             --remote ${REMOTE_ADDR} \
             $ARGS \
             "$@"
           EOF
-          
-          # 赋予脚本执行权限
           chmod +x docker-entrypoint.sh
 
-      # 4. [关键步骤] 现场生成 Dockerfile
-      # 完美复刻 Debian 的逻辑，但底层换成 Alpine
+      # 2. 现场生成 Dockerfile (Alpine 原生编译 + 瘦身)
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.alpine
-          # === 阶段 1: 编译 (Rust on Alpine) ===
+          # === 编译阶段 (Rust on Alpine) ===
           FROM rust:alpine AS builder
           WORKDIR /app
           # 安装 Musl 编译依赖
           RUN apk add --no-cache musl-dev binutils
-          # 拷贝源码
           COPY . .
-          # 开始编译 Release 版本
+          # 编译 Release
           RUN cargo build --release
-          # [瘦身] 移除调试符号 (体积减少 40%+)
+          # 瘦身 (减小体积)
           RUN strip target/release/server target/release/client
 
-          # === 阶段 2: 运行 (Pure Alpine) ===
+          # === 运行阶段 (纯净 Alpine) ===
           FROM alpine:latest
-          # 安装基础库 (CA证书用于HTTPS, tzdata用于时区)
+          # 安装基础库
           RUN apk add --no-cache ca-certificates tzdata
 
-          # 拷贝编译好的二进制文件 (重命名为中划线格式，适配脚本)
+          # 复制二进制文件
           COPY --from=builder /app/target/release/client /usr/local/bin/phantun-client
           COPY --from=builder /app/target/release/server /usr/local/bin/phantun-server
           
-          # 拷贝刚才生成的启动脚本 (就在当前根目录)
+          # 复制启动脚本
           COPY docker-entrypoint.sh /usr/local/bin/
           RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-          # 设置环境变量默认值 (与 Debian 版一致)
-          ENV RUN_MODE="client" \
-              LOCAL_ADDR="" \
-              REMOTE_ADDR="" \
-              TUN_NAME="" \
-              TUN_LOCAL="" \
-              TUN_PEER=""
+          ENV RUN_MODE="client" LOCAL_ADDR="" REMOTE_ADDR=""
 
           ENTRYPOINT ["docker-entrypoint.sh"]
           EOF
 
-      # 5. 执行构建并导出
-      - name: Build and Export
+      # 3. [核心修复] 构建并加载到本地 Docker (而非直接导出)
+      - name: Build Image
         run: |
           echo ">>> Building for ARM64..."
+          # 使用 --load 现加载到本地 docker daemon
           docker buildx build --platform linux/arm64 \
+            --load \
             -f Dockerfile.alpine \
-            -t phantun:alpine-native-arm64 \
-            --output type=docker,dest=phantun-alpine-arm64.tar .
+            -t phantun:arm64-latest .
 
-      # 6. 上传产物
+      # 4. [核心修复] 使用传统 save 命令导出 (RouterOS 兼容性最好)
+      - name: Save to Tar
+        run: |
+          echo ">>> Saving image to legacy tar format..."
+          docker save -o phantun-alpine.tar phantun:arm64-latest
+          echo ">>> File size:"
+          ls -lh phantun-alpine.tar
+
+      # 5. 上传结果
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: phantun-alpine-arm64
-          path: phantun-alpine-arm64.tar
+          path: phantun-alpine.tar
