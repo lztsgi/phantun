@@ -1,115 +1,99 @@
-name: Build Alpine for RouterOS (Fix Layer Error)
+name: Build and Release Phantun
 
 on:
   workflow_dispatch: # 手动触发
 
+permissions:
+  contents: write # 必须赋予写权限才能创建 Release
+
 jobs:
   build:
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: amd64
+            platform: linux/amd64
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 配置 QEMU 以支持 ARM64 编译
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # 配置 Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 1. 现场生成启动脚本 (包含您习惯的变量和 sleep 3)
-      - name: Generate Entrypoint Script
-        run: |
-          cat <<'EOF' > docker-entrypoint.sh
-          #!/bin/sh
-          set -e
-
-          # [关键] 等待 RouterOS 网卡初始化
-          sleep 3
-
-          # 根据模式选择程序
-          EXEC_NAME="phantun-server"
-          if [ "${RUN_MODE}" = "client" ]; then
-              EXEC_NAME="phantun-client"
-          fi
-
-          # 检查变量
-          if [ -z "${LOCAL_ADDR}" ]; then echo "Error: LOCAL_ADDR is not set"; exit 1; fi
-          if [ -z "${REMOTE_ADDR}" ]; then echo "Error: REMOTE_ADDR is not set"; exit 1; fi
-
-          # 拼接参数
-          ARGS=""
-          if [ ! -z "${TUN_NAME}" ]; then ARGS="$ARGS --tun ${TUN_NAME}"; fi
-          if [ ! -z "${TUN_LOCAL}" ]; then ARGS="$ARGS --tun_local ${TUN_LOCAL}"; fi
-          if [ ! -z "${TUN_PEER}" ]; then ARGS="$ARGS --tun_peer ${TUN_PEER}"; fi
-
-          echo "Starting Phantun (${EXEC_NAME}) on Alpine Native..."
-          echo "Local: ${LOCAL_ADDR} -> Remote: ${REMOTE_ADDR}"
-
-          # 启动
-          exec ${EXEC_NAME} \
-            --local ${LOCAL_ADDR} \
-            --remote ${REMOTE_ADDR} \
-            $ARGS \
-            "$@"
-          EOF
-          chmod +x docker-entrypoint.sh
-
-      # 2. 现场生成 Dockerfile (Alpine 原生编译 + 瘦身)
+      # 1. 动态生成通用 Dockerfile (Alpine)
+      # 修改点：去掉了 sleep 3
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.alpine
-          # === 编译阶段 (Rust on Alpine) ===
+          # === 编译阶段 ===
           FROM rust:alpine AS builder
           WORKDIR /app
-          # 安装 Musl 编译依赖
           RUN apk add --no-cache musl-dev binutils
           COPY . .
-          # 编译 Release
           RUN cargo build --release
-          # 瘦身 (减小体积)
           RUN strip target/release/server target/release/client
 
-          # === 运行阶段 (纯净 Alpine) ===
+          # === 运行阶段 ===
           FROM alpine:latest
-          # 安装基础库
           RUN apk add --no-cache ca-certificates tzdata
 
-          # 复制二进制文件
           COPY --from=builder /app/target/release/client /usr/local/bin/phantun-client
           COPY --from=builder /app/target/release/server /usr/local/bin/phantun-server
           
-          # 复制启动脚本
-          COPY docker-entrypoint.sh /usr/local/bin/
+          # 生成通用启动脚本 (无 sleep 版)
+          RUN printf '#!/bin/sh\n\
+          set -e\n\
+          # sleep 3  <-- 已移除\n\
+          EXEC_NAME="phantun-server"\n\
+          if [ "\$RUN_MODE" = "client" ]; then EXEC_NAME="phantun-client"; fi\n\
+          if [ -z "\$LOCAL_ADDR" ]; then echo "Error: LOCAL_ADDR missing"; exit 1; fi\n\
+          if [ -z "\$REMOTE_ADDR" ]; then echo "Error: REMOTE_ADDR missing"; exit 1; fi\n\
+          ARGS=""\n\
+          if [ ! -z "\$TUN_NAME" ]; then ARGS="\$ARGS --tun \$TUN_NAME"; fi\n\
+          if [ ! -z "\$TUN_LOCAL" ]; then ARGS="\$ARGS --tun_local \$TUN_LOCAL"; fi\n\
+          if [ ! -z "\$TUN_PEER" ]; then ARGS="\$ARGS --tun_peer \$TUN_PEER"; fi\n\
+          echo "Starting Phantun (\$EXEC_NAME) on Alpine..."\n\
+          exec \$EXEC_NAME --local \$LOCAL_ADDR --remote \$REMOTE_ADDR \$ARGS "\$@"\n' > /usr/local/bin/docker-entrypoint.sh
+
           RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
           ENV RUN_MODE="client" LOCAL_ADDR="" REMOTE_ADDR=""
-
           ENTRYPOINT ["docker-entrypoint.sh"]
           EOF
 
-      # 3. [核心修复] 构建并加载到本地 Docker (而非直接导出)
+      # 2. 构建并加载到 Docker
       - name: Build Image
         run: |
-          echo ">>> Building for ARM64..."
-          # 使用 --load 现加载到本地 docker daemon
-          docker buildx build --platform linux/arm64 \
+          echo ">>> Building for ${{ matrix.arch }}..."
+          docker buildx build --platform ${{ matrix.platform }} \
             --load \
             -f Dockerfile.alpine \
-            -t phantun:arm64-latest .
+            -t phantun:${{ matrix.arch }} .
 
-      # 4. [核心修复] 使用传统 save 命令导出 (RouterOS 兼容性最好)
+      # 3. 导出为兼容 Tar 包
       - name: Save to Tar
         run: |
-          echo ">>> Saving image to legacy tar format..."
-          docker save -o phantun-alpine.tar phantun:arm64-latest
-          echo ">>> File size:"
-          ls -lh phantun-alpine.tar
+          FILENAME="phantun-linux-${{ matrix.arch }}.tar"
+          docker save -o $FILENAME phantun:${{ matrix.arch }}
+          echo "Generated: $FILENAME"
 
-      # 5. 上传结果
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      # 4. 发布到 GitHub Releases
+      # 只有手动触发时才会运行此步骤
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          name: phantun-alpine-arm64
-          path: phantun-alpine.tar
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }} (${{ github.sha }})
+          files: phantun-linux-${{ matrix.arch }}.tar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
