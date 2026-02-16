@@ -3,11 +3,24 @@ name: Build and Release Phantun
 on:
   workflow_dispatch: # 手动触发
 
+# =================================================
+# 🟢 配置区域 (修改这里即可改变版本和名称)
+# =================================================
+env:
+  # 软件名称 (用于文件名)
+  APP_NAME: "phantun"
+  # 版本号 (用于 Release 标题和文件名)
+  APP_VERSION: "0.8.1"
+  # 平台前缀 (例如 phantun-linux-...)
+  FILE_PREFIX: "phantun-linux"
+# =================================================
+
 permissions:
-  contents: write # 必须赋予写权限才能创建 Release
+  contents: write # 允许创建 Release
 
 jobs:
   build:
+    # 显示当前构建的架构
     name: Build ${{ matrix.arch }}
     runs-on: ubuntu-latest
     strategy:
@@ -29,7 +42,6 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # 1. 动态生成通用 Dockerfile (Alpine)
-      # 修改点：去掉了 sleep 3
       - name: Generate Dockerfile
         run: |
           cat <<EOF > Dockerfile.alpine
@@ -51,7 +63,7 @@ jobs:
           # 生成通用启动脚本 (无 sleep 版)
           RUN printf '#!/bin/sh\n\
           set -e\n\
-          # sleep 3  <-- 已移除\n\
+          # sleep 3 (已移除)\n\
           EXEC_NAME="phantun-server"\n\
           if [ "\$RUN_MODE" = "client" ]; then EXEC_NAME="phantun-client"; fi\n\
           if [ -z "\$LOCAL_ADDR" ]; then echo "Error: LOCAL_ADDR missing"; exit 1; fi\n\
@@ -68,7 +80,7 @@ jobs:
           ENTRYPOINT ["docker-entrypoint.sh"]
           EOF
 
-      # 2. 构建并加载到 Docker
+      # 2. 构建并加载
       - name: Build Image
         run: |
           echo ">>> Building for ${{ matrix.arch }}..."
@@ -77,22 +89,26 @@ jobs:
             -f Dockerfile.alpine \
             -t phantun:${{ matrix.arch }} .
 
-      # 3. 导出为兼容 Tar 包
+      # 3. 导出为 Tar 包 (使用自定义变量命名)
       - name: Save to Tar
         run: |
-          FILENAME="phantun-linux-${{ matrix.arch }}.tar"
+          # 组合文件名: phantun-linux-0.8.1-arm64.tar
+          FILENAME="${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}.tar"
+          
           docker save -o $FILENAME phantun:${{ matrix.arch }}
           echo "Generated: $FILENAME"
 
       # 4. 发布到 GitHub Releases
-      # 只有手动触发时才会运行此步骤
       - name: Upload to Release
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }} (${{ github.sha }})
-          files: phantun-linux-${{ matrix.arch }}.tar
+          # Tag 格式: v0.8.1-b4 (防止重复构建报错)
+          tag_name: v${{ env.APP_VERSION }}-b${{ github.run_number }}
+          # 标题格式: Phantun v0.8.1
+          name: ${{ env.APP_NAME }} v${{ env.APP_VERSION }}
+          # 上传的文件匹配模式
+          files: ${{ env.FILE_PREFIX }}-${{ env.APP_VERSION }}-${{ matrix.arch }}.tar
           draft: false
           prerelease: false
         env:
