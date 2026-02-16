@@ -1,51 +1,100 @@
-name: Build Custom Alpine Image
+name: Build Alpine Native Image (Fix)
 
 on:
-  workflow_dispatch: # 允许手动点击按钮触发
+  workflow_dispatch: # 手动触发
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
     steps:
+      # 1. 拉取源码 (Phantun 的 Rust 代码)
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # 2. 设置构建环境
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
-
+      
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and Export
+      # 3. [关键步骤] 现场生成启动脚本
+      # 我们直接把您的脚本写入当前目录，确保 Docker 一定能找到它！
+      # 使用 'EOF' 防止变量在生成时被在此处解析
+      - name: Generate Entrypoint Script
         run: |
-          # 1. 动态生成 Dockerfile (原生 Alpine 编译 + 瘦身)
-          cat > Dockerfile.alpine <<EOF
-          # --- 编译阶段 ---
+          cat <<'EOF' > docker-entrypoint.sh
+          #!/bin/sh
+          set -e
+
+          # [Debian逻辑移植] 等待 ROS 网络就绪
+          sleep 3
+
+          # 根据模式选择二进制文件名
+          EXEC_NAME="phantun-server"
+          if [ "${RUN_MODE}" = "client" ]; then
+              EXEC_NAME="phantun-client"
+          fi
+
+          # 检查必要变量
+          if [ -z "${LOCAL_ADDR}" ]; then echo "Error: LOCAL_ADDR is not set"; exit 1; fi
+          if [ -z "${REMOTE_ADDR}" ]; then echo "Error: REMOTE_ADDR is not set"; exit 1; fi
+
+          # 拼接可选参数
+          ARGS=""
+          if [ ! -z "${TUN_NAME}" ]; then ARGS="$ARGS --tun ${TUN_NAME}"; fi
+          if [ ! -z "${TUN_LOCAL}" ]; then ARGS="$ARGS --tun_local ${TUN_LOCAL}"; fi
+          if [ ! -z "${TUN_PEER}" ]; then ARGS="$ARGS --tun_peer ${TUN_PEER}"; fi
+
+          echo "Starting Phantun (${EXEC_NAME}) on Alpine Native..."
+          echo "Local: ${LOCAL_ADDR} -> Remote: ${REMOTE_ADDR}"
+
+          # 使用 exec 启动
+          exec ${EXEC_NAME} \
+            --local ${LOCAL_ADDR} \
+            --remote ${REMOTE_ADDR} \
+            $ARGS \
+            "$@"
+          EOF
+          
+          # 赋予脚本执行权限
+          chmod +x docker-entrypoint.sh
+
+      # 4. [关键步骤] 现场生成 Dockerfile
+      # 完美复刻 Debian 的逻辑，但底层换成 Alpine
+      - name: Generate Dockerfile
+        run: |
+          cat <<EOF > Dockerfile.alpine
+          # === 阶段 1: 编译 (Rust on Alpine) ===
           FROM rust:alpine AS builder
           WORKDIR /app
           # 安装 Musl 编译依赖
           RUN apk add --no-cache musl-dev binutils
           # 拷贝源码
           COPY . .
-          # 编译 Release 版本
+          # 开始编译 Release 版本
           RUN cargo build --release
-          # [关键] 移除调试符号，减小体积 (从 80MB -> 15MB)
+          # [瘦身] 移除调试符号 (体积减少 40%+)
           RUN strip target/release/server target/release/client
 
-          # --- 运行阶段 ---
+          # === 阶段 2: 运行 (Pure Alpine) ===
           FROM alpine:latest
-          # 安装基础证书和时区
+          # 安装基础库 (CA证书用于HTTPS, tzdata用于时区)
           RUN apk add --no-cache ca-certificates tzdata
 
-          # 拷贝编译好的文件
+          # 拷贝编译好的二进制文件 (重命名为中划线格式，适配脚本)
           COPY --from=builder /app/target/release/client /usr/local/bin/phantun-client
           COPY --from=builder /app/target/release/server /usr/local/bin/phantun-server
           
-          # 拷贝刚才创建的启动脚本
+          # 拷贝刚才生成的启动脚本 (就在当前根目录)
           COPY docker-entrypoint.sh /usr/local/bin/
           RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-          # 设置环境变量默认值
+          # 设置环境变量默认值 (与 Debian 版一致)
           ENV RUN_MODE="client" \
               LOCAL_ADDR="" \
               REMOTE_ADDR="" \
@@ -56,15 +105,18 @@ jobs:
           ENTRYPOINT ["docker-entrypoint.sh"]
           EOF
 
-          # 2. 执行构建 (目标架构: arm64/RouterOS)
-          echo ">>> Building Image..."
+      # 5. 执行构建并导出
+      - name: Build and Export
+        run: |
+          echo ">>> Building for ARM64..."
           docker buildx build --platform linux/arm64 \
             -f Dockerfile.alpine \
-            -t phantun:custom-alpine \
-            --output type=docker,dest=phantun-custom.tar .
+            -t phantun:alpine-native-arm64 \
+            --output type=docker,dest=phantun-alpine-arm64.tar .
 
+      # 6. 上传产物
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: phantun-custom-tar
-          path: phantun-custom.tar
+          name: phantun-alpine-arm64
+          path: phantun-alpine-arm64.tar
