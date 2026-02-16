@@ -1,0 +1,67 @@
+name: Build Custom Alpine Image
+
+on:
+  workflow_dispatch: # 允许手动点按钮触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Export
+        run: |
+          # 1. 动态生成 Dockerfile (原生 Alpine 编译 + 瘦身)
+          cat > Dockerfile.alpine <<EOF
+          # --- 编译阶段 ---
+          FROM rust:alpine AS builder
+          WORKDIR /app
+          # 安装 Musl 编译依赖
+          RUN apk add --no-cache musl-dev binutils
+          # 拷贝源码
+          COPY . .
+          # 编译 Release 版本
+          RUN cargo build --release
+          # [关键] 移除调试符号，减小体积 (从 80MB -> 15MB)
+          RUN strip target/release/server target/release/client
+
+          # --- 运行阶段 ---
+          FROM alpine:latest
+          # 安装基础证书和时区
+          RUN apk add --no-cache ca-certificates tzdata
+
+          # 拷贝编译好的文件
+          COPY --from=builder /app/target/release/client /usr/local/bin/phantun-client
+          COPY --from=builder /app/target/release/server /usr/local/bin/phantun-server
+          
+          # 拷贝刚才创建的启动脚本
+          COPY docker-entrypoint.sh /usr/local/bin/
+          RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+          # 设置环境变量默认值
+          ENV RUN_MODE="client" \
+              LOCAL_ADDR="" \
+              REMOTE_ADDR="" \
+              TUN_NAME="" \
+              TUN_LOCAL="" \
+              TUN_PEER=""
+
+          ENTRYPOINT ["docker-entrypoint.sh"]
+          EOF
+
+          # 2. 执行构建 (目标架构: arm64/RouterOS)
+          echo ">>> Building Image..."
+          docker buildx build --platform linux/arm64 \
+            -f Dockerfile.alpine \
+            -t phantun:custom-alpine \
+            --output type=docker,dest=phantun-custom.tar .
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantun-custom-tar
+          path: phantun-custom.tar
