@@ -77,7 +77,7 @@ jobs:
 
           RUN chmod +x /usr/local/bin/docker-entrypoint.sh
           ENV RUN_MODE="client" LOCAL_ADDR="" REMOTE_ADDR=""
-          ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+          ENTRYPOINT ["docker-entrypoint.sh"]
           EOF
 
       # 2. 构建并加载
